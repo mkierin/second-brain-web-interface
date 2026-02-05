@@ -1,0 +1,77 @@
+# Environment variables (SENSITIVE!)
+.env
+.env.local
+.env.production
+.env.development
+backend/.env
+frontend/.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+backend/venv/
+backend/env/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+
+# Logs (may contain sensitive data)
+*.log
+logs/
+*.log.*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# SSL Certificates (SENSITIVE!)
+*.pem
+*.key
+*.crt
+*.csr
+
+# Secrets and keys (SENSITIVE!)
+*secret*
+*password*
+*token*
+*.pem
+
+# PM2
+.pm2/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# OS
+Thumbs.db
+.DS_Store
