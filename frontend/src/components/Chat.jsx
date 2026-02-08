@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import axios from 'axios'
+import api from '../api'
+import ReactMarkdown from 'react-markdown'
 import {
   MainContainer,
   ChatContainer,
@@ -12,32 +13,27 @@ import {
 import '@chatscope/chat-ui-kit-styles/dist/default/styles.min.css'
 import '../styles/Chat.css'
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const AGENTS = [
+  { value: 'auto', label: 'Auto' },
+  { value: 'researcher', label: 'Researcher' },
+  { value: 'archivist', label: 'Archivist' },
+  { value: 'coder', label: 'Coder' },
+  { value: 'writer', label: 'Writer' },
+  { value: 'journal', label: 'Journal' },
+  { value: 'task_manager', label: 'Task Manager' },
+]
 
-function Chat({ token, username, onLogout }) {
+function Chat({ token, username }) {
   const [messages, setMessages] = useState([])
   const [isTyping, setIsTyping] = useState(false)
   const [inputValue, setInputValue] = useState('')
+  const [selectedAgent, setSelectedAgent] = useState('auto')
   const pollingInterval = useRef(null)
 
-  const api = axios.create({
-    baseURL: API_URL,
-    headers: {
-      'Authorization': `Bearer ${token}`
-    }
-  })
+  useEffect(() => { loadHistory() }, [])
 
-  // Load conversation history
   useEffect(() => {
-    loadHistory()
-  }, [])
-
-  // Poll for new bot responses
-  useEffect(() => {
-    pollingInterval.current = setInterval(() => {
-      checkForResponses()
-    }, 2000) // Poll every 2 seconds
-
+    pollingInterval.current = setInterval(checkForResponses, 2000)
     return () => clearInterval(pollingInterval.current)
   }, [])
 
@@ -76,8 +72,6 @@ function Chat({ token, username, onLogout }) {
 
   const handleSend = async (message) => {
     if (!message.trim()) return
-
-    // Add user message to UI
     const userMessage = {
       message: message,
       sender: 'user',
@@ -89,7 +83,9 @@ function Chat({ token, username, onLogout }) {
     setIsTyping(true)
 
     try {
-      await api.post('/messages/send', { message })
+      const body = { message }
+      if (selectedAgent !== 'auto') body.agent = selectedAgent
+      await api.post('/messages/send', body)
     } catch (err) {
       console.error('Failed to send message:', err)
       setIsTyping(false)
@@ -104,16 +100,17 @@ function Chat({ token, username, onLogout }) {
 
   return (
     <div className="chat-wrapper">
-      <div className="chat-header">
-        <div className="header-content">
-          <h2>🧠 Brain Bot</h2>
-          <div className="header-actions">
-            <span className="username">@{username}</span>
-            <button onClick={onLogout} className="logout-button">Logout</button>
-          </div>
+      <div className="chat-top-bar">
+        <h1>Chat</h1>
+        <div className="agent-selector">
+          <label>Agent:</label>
+          <select value={selectedAgent} onChange={e => setSelectedAgent(e.target.value)}>
+            {AGENTS.map(a => (
+              <option key={a.value} value={a.value}>{a.label}</option>
+            ))}
+          </select>
         </div>
       </div>
-
       <div className="chat-container">
         <MainContainer>
           <ChatContainer>
@@ -124,12 +121,21 @@ function Chat({ token, username, onLogout }) {
                 <Message
                   key={i}
                   model={{
-                    message: msg.message,
+                    message: '',
                     sender: msg.sender,
                     direction: msg.direction,
                     position: msg.position
                   }}
                 >
+                  <Message.CustomContent>
+                    {msg.sender !== 'user' ? (
+                      <div className="markdown-content">
+                        <ReactMarkdown>{msg.message}</ReactMarkdown>
+                      </div>
+                    ) : (
+                      <span>{msg.message}</span>
+                    )}
+                  </Message.CustomContent>
                   {msg.sender !== 'user' && (
                     <Avatar src="/bot-avatar.png" name="Brain Bot" />
                   )}

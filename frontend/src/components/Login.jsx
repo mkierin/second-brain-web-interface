@@ -21,7 +21,7 @@ function Login({ onLogin }) {
         password
       })
 
-      onLogin(response.data.access_token, response.data.username)
+      onLogin(response.data.access_token, response.data.username, password)
     } catch (err) {
       setError(err.response?.data?.detail || 'Login failed')
     } finally {
@@ -33,8 +33,8 @@ function Login({ onLogin }) {
     <div className="login-container">
       <div className="login-box">
         <div className="login-header">
-          <h1>🧠 Brain Bot</h1>
-          <p>Your Personal AI Assistant</p>
+          <h1>Brain Bot</h1>
+          <p>Login to access your dashboard</p>
         </div>
 
         <form onSubmit={handleSubmit} className="login-form">
@@ -67,8 +67,7 @@ function Login({ onLogin }) {
         </form>
 
         <div className="login-footer">
-          <p>Default: admin / changeme123</p>
-          <small>Change the password after first login!</small>
+          <small>Secure access to your Brain Bot</small>
         </div>
       </div>
     </div>
