@@ -20,6 +20,7 @@ os.environ["CHROMA_PATH"] = "/root/assistant-brain-os/data/chroma"
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import jwt
@@ -30,8 +31,10 @@ import subprocess
 import glob as globmod
 from datetime import datetime, timedelta
 import bcrypt
+import asyncio
+import pathlib
 
-from common.routing import route_deterministic
+from common.routing import route_deterministic, is_casual, get_casual_response
 
 # Configuration
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change-this-in-production-please")
@@ -49,7 +52,7 @@ app = FastAPI(title="Brain Bot API", version="2.0.0")
 cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173,http://77.42.93.224").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -188,32 +191,63 @@ async def send_message(
     from common.contracts import Job
     from common.config import TASK_QUEUE
 
-    # Phase 1a fix: use shared route_deterministic instead of simplified _route_web_message
+    conv_key = f"web_conversation:{user['user_id']}"
+    now = datetime.now().isoformat()
+
+    # Store user message in conversation history
+    message_id = str(uuid.uuid4())
+    message_data = {
+        "id": message_id,
+        "message": message_req.message,
+        "sender": "user",
+        "timestamp": now
+    }
+    redis_client.lpush(conv_key, json.dumps(message_data))
+    redis_client.expire(conv_key, 86400)
+
+    # Check for casual messages - respond instantly without queuing a job
+    if (not message_req.agent or message_req.agent == "auto") and is_casual(message_req.message):
+        casual_response = get_casual_response(message_req.message)
+        response_data = {
+            "id": str(uuid.uuid4()),
+            "message": casual_response,
+            "sender": "bot",
+            "agent": "casual",
+            "timestamp": datetime.now().isoformat()
+        }
+        response_key = f"web_response:{user['user_id']}"
+        redis_client.lpush(response_key, json.dumps(response_data))
+        redis_client.expire(response_key, 3600)
+        redis_client.lpush(conv_key, json.dumps(response_data))
+        redis_client.expire(conv_key, 86400)
+        return MessageResponse(**message_data)
+
+    # Route to agent
     if message_req.agent and message_req.agent != "auto":
         agent = message_req.agent
     else:
         agent = route_deterministic(message_req.message)
+
+    # Attach recent conversation context for agents that use LLM
+    recent_msgs = redis_client.lrange(conv_key, 0, 5)
+    conversation_history = []
+    for msg_json in recent_msgs:
+        try:
+            conversation_history.append(json.loads(msg_json))
+        except Exception:
+            pass
 
     job = Job(
         current_agent=agent,
         payload={
             "text": message_req.message,
             "source": "web",
-            "user_id": user["user_id"]
+            "user_id": user["user_id"],
+            "conversation_history": list(reversed(conversation_history[-6:]))
         }
     )
     redis_client.lpush(TASK_QUEUE, job.model_dump_json())
 
-    message_id = str(uuid.uuid4())
-    message_data = {
-        "id": message_id,
-        "message": message_req.message,
-        "sender": "user",
-        "timestamp": datetime.now().isoformat()
-    }
-    conv_key = f"web_conversation:{user['user_id']}"
-    redis_client.lpush(conv_key, json.dumps(message_data))
-    redis_client.expire(conv_key, 86400)
     return MessageResponse(**message_data)
 
 @app.get("/messages/history", response_model=List[MessageResponse])
@@ -241,6 +275,43 @@ async def check_pending_messages(username: str = Depends(verify_token)):
             break
         responses.append(json.loads(response_data))
     return {"responses": responses}
+
+@app.get("/messages/stream")
+async def message_stream(token: str = ""):
+    """SSE endpoint for real-time message delivery."""
+    # Validate token from query param (EventSource can't set headers)
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if not username:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = _get_user(username)
+    response_key = f"web_response:{user['user_id']}"
+
+    async def event_generator():
+        while True:
+            try:
+                msg = redis_client.lpop(response_key)
+                if msg:
+                    yield f"data: {msg.decode()}\n\n"
+                else:
+                    yield ": heartbeat\n\n"
+                await asyncio.sleep(0.3)
+            except Exception:
+                break
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
 # --- Knowledge Base ---
 
@@ -306,6 +377,60 @@ async def advanced_search(
         return {"entries": results, "count": len(results), "query": query}
     except Exception as e:
         return {"entries": [], "count": 0, "query": query, "error": str(e)}
+
+class KnowledgeAddRequest(BaseModel):
+    text: str
+    tags: Optional[List[str]] = None
+    source: str = "web"
+    url: Optional[str] = None
+
+@app.post("/knowledge/add")
+async def add_knowledge_entry(
+    req: KnowledgeAddRequest,
+    username: str = Depends(verify_token)
+):
+    """Add a knowledge entry directly from the web interface."""
+    from common.database import db
+    from common.contracts import KnowledgeEntry
+
+    text = req.text.strip()
+    if len(text) < 3:
+        raise HTTPException(400, "Content too short to save")
+
+    # Auto-extract tags if none provided
+    if req.tags:
+        tags = req.tags
+    else:
+        from agents.archivist import _extract_tags
+        tags = _extract_tags(text)
+
+    metadata = {}
+    if req.url:
+        metadata["url"] = req.url
+
+    entry = KnowledgeEntry(
+        text=text,
+        tags=tags,
+        source=req.source,
+        metadata=metadata,
+        embedding_id=str(uuid.uuid4())
+    )
+    db.add_knowledge(entry)
+
+    return {"message": "Saved", "id": entry.embedding_id, "tags": tags}
+
+@app.delete("/knowledge/{entry_id}")
+async def delete_knowledge_entry(
+    entry_id: str,
+    username: str = Depends(verify_token)
+):
+    """Delete a knowledge entry."""
+    from common.database import db
+    try:
+        db.delete_entry(entry_id)
+        return {"message": "Deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- Dashboard Overview ---
 
@@ -716,6 +841,102 @@ async def get_errors(limit: int = 20, username: str = Depends(verify_token)):
         return {"errors": errors, "count": len(errors)}
     except Exception as e:
         return {"errors": [], "count": 0, "error": str(e)}
+
+# --- Health ---
+
+# --- Settings ---
+
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+
+def _load_settings() -> dict:
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {}
+
+def _save_settings(settings: dict):
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f, indent=2)
+
+class LLMSettingsRequest(BaseModel):
+    provider: str  # "openai", "deepseek", "openrouter"
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+
+@app.get("/settings/llm")
+async def get_llm_settings(username: str = Depends(verify_token)):
+    """Get current LLM provider settings."""
+    from common.config import LLM_PROVIDER, MODEL_NAME
+    settings = _load_settings()
+    user_settings = settings.get(username, {}).get("llm", {})
+
+    # Mask API keys for display
+    def mask_key(key):
+        if not key:
+            return ""
+        if len(key) <= 8:
+            return "***"
+        return key[:4] + "..." + key[-4:]
+
+    return {
+        "provider": user_settings.get("provider", LLM_PROVIDER),
+        "model": user_settings.get("model", MODEL_NAME),
+        "has_openai_key": bool(os.getenv("OPENAI_API_KEY")),
+        "has_deepseek_key": bool(os.getenv("DEEPSEEK_API_KEY")),
+        "has_openrouter_key": bool(os.getenv("OPENROUTER_API_KEY") or user_settings.get("openrouter_key")),
+        "openrouter_key_masked": mask_key(user_settings.get("openrouter_key", os.getenv("OPENROUTER_API_KEY", ""))),
+    }
+
+@app.post("/settings/llm")
+async def update_llm_settings(
+    req: LLMSettingsRequest,
+    username: str = Depends(verify_token)
+):
+    """Update LLM provider settings. Writes to .env.overrides for worker pickup."""
+    settings = _load_settings()
+    if username not in settings:
+        settings[username] = {}
+
+    settings[username]["llm"] = {
+        "provider": req.provider,
+        "model": req.model,
+    }
+
+    # Store OpenRouter key per-user if provided
+    if req.api_key and req.provider == "openrouter":
+        settings[username]["llm"]["openrouter_key"] = req.api_key
+
+    _save_settings(settings)
+
+    # Write overrides to .env.overrides for worker to pick up
+    overrides_path = "/root/assistant-brain-os/.env.overrides"
+    overrides = {}
+    if os.path.exists(overrides_path):
+        try:
+            with open(overrides_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if '=' in line and not line.startswith('#'):
+                        k, v = line.split('=', 1)
+                        overrides[k] = v
+        except Exception:
+            pass
+
+    overrides["LLM_PROVIDER"] = req.provider
+    if req.model:
+        if req.provider == "openrouter":
+            overrides["OPENROUTER_MODEL"] = req.model
+    if req.api_key and req.provider == "openrouter":
+        overrides["OPENROUTER_API_KEY"] = req.api_key
+
+    with open(overrides_path, "w") as f:
+        for k, v in overrides.items():
+            f.write(f"{k}={v}\n")
+
+    return {"message": "Settings saved", "provider": req.provider, "model": req.model}
 
 # --- Health ---
 

@@ -8,6 +8,12 @@ function KnowledgeBase({ token }) {
   const [loading, setLoading] = useState(false)
   const [selectedEntry, setSelectedEntry] = useState(null)
   const [showFilters, setShowFilters] = useState(false)
+  const [showAddForm, setShowAddForm] = useState(false)
+  const [addText, setAddText] = useState('')
+  const [addTags, setAddTags] = useState('')
+  const [addUrl, setAddUrl] = useState('')
+  const [addLoading, setAddLoading] = useState(false)
+  const [addMessage, setAddMessage] = useState('')
   const [filters, setFilters] = useState({
     tags: '',
     date_from: '',
@@ -55,9 +61,80 @@ function KnowledgeBase({ token }) {
     loadEntries(searchQuery)
   }
 
+  const handleAdd = async (e) => {
+    e.preventDefault()
+    if (!addText.trim()) return
+    setAddLoading(true)
+    setAddMessage('')
+    try {
+      const body = { text: addText.trim(), source: 'web' }
+      if (addTags.trim()) body.tags = addTags.split(',').map(t => t.trim()).filter(Boolean)
+      if (addUrl.trim()) body.url = addUrl.trim()
+      const res = await api.post('/knowledge/add', body)
+      setAddMessage(`Saved! Tags: ${(res.data.tags || []).join(', ')}`)
+      setAddText('')
+      setAddTags('')
+      setAddUrl('')
+      setTimeout(() => { setShowAddForm(false); setAddMessage(''); loadEntries(searchQuery) }, 1500)
+    } catch (err) {
+      setAddMessage(err.response?.data?.detail || 'Failed to save')
+    } finally {
+      setAddLoading(false)
+    }
+  }
+
+  const handleDelete = async (entryId) => {
+    if (!window.confirm('Delete this entry?')) return
+    try {
+      await api.delete(`/knowledge/${entryId}`)
+      setSelectedEntry(null)
+      loadEntries(searchQuery)
+    } catch (err) {
+      console.error('Failed to delete:', err)
+    }
+  }
+
   return (
     <div className="knowledge-base-content">
-      <h1>Knowledge Base</h1>
+      <div className="kb-header">
+        <h1>Knowledge Base</h1>
+        <button className="add-knowledge-btn" onClick={() => setShowAddForm(!showAddForm)}>
+          {showAddForm ? 'Cancel' : '+ Add Knowledge'}
+        </button>
+      </div>
+
+      {showAddForm && (
+        <form onSubmit={handleAdd} className="add-knowledge-form">
+          <textarea
+            placeholder="Write your note, idea, or paste content here..."
+            value={addText}
+            onChange={e => setAddText(e.target.value)}
+            rows={4}
+          />
+          <div className="add-form-row">
+            <input
+              type="text"
+              placeholder="Tags (comma-separated, optional)"
+              value={addTags}
+              onChange={e => setAddTags(e.target.value)}
+            />
+            <input
+              type="url"
+              placeholder="Source URL (optional)"
+              value={addUrl}
+              onChange={e => setAddUrl(e.target.value)}
+            />
+          </div>
+          {addMessage && (
+            <div className={addMessage.startsWith('Saved') ? 'success-message' : 'error-message'}>
+              {addMessage}
+            </div>
+          )}
+          <button type="submit" disabled={addLoading || !addText.trim()}>
+            {addLoading ? 'Saving...' : 'Save to Brain'}
+          </button>
+        </form>
+      )}
 
       <form onSubmit={handleSearch} className="search-bar">
         <input
@@ -122,7 +199,12 @@ function KnowledgeBase({ token }) {
         <div className="entries-grid">
           {entries.length === 0 ? (
             <div className="no-entries">
-              <p>No entries found. Start adding content through Telegram!</p>
+              <p>No entries found.</p>
+              {!showAddForm && (
+                <button className="add-knowledge-btn" onClick={() => setShowAddForm(true)}>
+                  Add your first note
+                </button>
+              )}
             </div>
           ) : (
             entries.map((entry, idx) => (
@@ -173,6 +255,14 @@ function KnowledgeBase({ token }) {
               <a href={selectedEntry.url} target="_blank" rel="noopener noreferrer" className="entry-link">
                 View Source &rarr;
               </a>
+            )}
+            {selectedEntry.id && (
+              <button
+                className="delete-entry-btn"
+                onClick={() => handleDelete(selectedEntry.id)}
+              >
+                Delete Entry
+              </button>
             )}
           </div>
         </div>
